@@ -1,4 +1,4 @@
-module github.com/sevir/gluawtach
+module github.com/sevir/gluawatch
 
 go 1.23.4
 
