@@ -1,0 +1,188 @@
+package main
+
+import (
+	"fmt"
+	"log"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/fsnotify/fsnotify"
+	"github.com/yuin/gopher-lua"
+)
+
+// Ignorar estos directorios
+var ignoredPaths = []string{".git", "node_modules", "vendor", "__pycache__"}
+
+// Debouncer para evitar múltiples ejecuciones
+type Debouncer struct {
+	mu       sync.Mutex
+	timers   map[string]*time.Timer
+	delay    time.Duration
+	luaState *lua.LState
+	luaFunc  *lua.LFunction
+}
+
+func NewDebouncer(L *lua.LState, luaFunc *lua.LFunction, delay time.Duration) *Debouncer {
+	return &Debouncer{
+		timers:   make(map[string]*time.Timer),
+		delay:    delay,
+		luaState: L,
+		luaFunc:  luaFunc,
+	}
+}
+
+func (d *Debouncer) Trigger(file string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Si ya existe un timer para el archivo, lo reinicia
+	if timer, exists := d.timers[file]; exists {
+		timer.Stop()
+	}
+
+	// Crear un nuevo timer
+	d.timers[file] = time.AfterFunc(d.delay, func() {
+		d.mu.Lock()
+		delete(d.timers, file)
+		d.mu.Unlock()
+
+		fmt.Println("Ejecutando Lua para:", file)
+		d.luaState.CallByParam(lua.P{
+			Fn:      d.luaFunc,
+			NRet:    0,
+			Protect: true,
+		}, lua.LString(file))
+	})
+}
+
+// isIgnoredPath verifica si un path debe ser ignorado
+func isIgnoredPath(path string) bool {
+	for _, ignored := range ignoredPaths {
+		if strings.Contains(path, ignored) {
+			return true
+		}
+	}
+	return false
+}
+
+// addRecursiveWatcher agrega recursivamente todos los directorios al watcher
+func addRecursiveWatcher(watcher *fsnotify.Watcher, rootPath string) error {
+	return filepath.WalkDir(rootPath, func(path string, d filepath.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() && !isIgnoredPath(path) {
+			err := watcher.Add(path)
+			if err != nil {
+				log.Printf("Error al monitorear %s: %v", path, err)
+			} else {
+				fmt.Println("Monitoreando:", path)
+			}
+		}
+		return nil
+	})
+}
+
+// watchFiles monitorea archivos y ejecuta la función Lua con debounce
+func watchFiles(L *lua.LState, paths []string, luaFunc *lua.LFunction) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer watcher.Close()
+
+	debouncer := NewDebouncer(L, luaFunc, 500*time.Millisecond)
+
+	// Agregar paths recursivamente
+	for _, path := range paths {
+		if err := addRecursiveWatcher(watcher, path); err != nil {
+			log.Printf("Error al añadir %s: %v", path, err)
+		}
+	}
+
+	// Goroutine para manejar eventos
+	go func() {
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+				if isIgnoredPath(event.Name) {
+					continue
+				}
+				fmt.Println("Cambio detectado en:", event.Name, "Tipo:", event.Op)
+
+				// Disparar la ejecución con debounce
+				debouncer.Trigger(event.Name)
+
+				// Si se crea un nuevo directorio, agregarlo al watcher
+				if event.Op&fsnotify.Create == fsnotify.Create {
+					fileInfo, err := filepath.Glob(event.Name)
+					if err == nil && fileInfo != nil {
+						watcher.Add(event.Name)
+					}
+				}
+
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				log.Println("Error en watcher:", err)
+			}
+		}
+	}()
+
+	// Mantener el programa corriendo
+	select {}
+}
+
+// goWatch expone watchFiles a Lua
+func goWatch(L *lua.LState) int {
+	// Obtener paths desde Lua (esperado como una tabla de strings)
+	pathsTable := L.ToTable(1)
+	paths := []string{}
+	pathsTable.ForEach(func(_, value lua.LValue) {
+		if str, ok := value.(lua.LString); ok {
+			paths = append(paths, string(str))
+		}
+	})
+
+	// Obtener la función Lua a ejecutar
+	luaFunc := L.ToFunction(2)
+	if luaFunc == nil {
+		L.Push(lua.LString("Error: Se requiere una función Lua"))
+		return 1
+	}
+
+	// Iniciar la monitorización en un goroutine
+	go watchFiles(L, paths, luaFunc)
+
+	L.Push(lua.LNil)
+	return 1
+}
+
+func main() {
+	L := lua.NewState()
+	defer L.Close()
+
+	// Registrar la función en Lua
+	L.SetGlobal("watch", L.NewFunction(goWatch))
+
+	// Script de prueba en Lua
+	script := `
+	paths = { "./testdir" }
+
+	function onChange(file)
+		print("¡Cambio detectado en:", file, "!")
+	end
+
+	watch(paths, onChange)
+	`
+
+	if err := L.DoString(script); err != nil {
+		log.Fatal(err)
+	}
+}
